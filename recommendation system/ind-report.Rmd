@@ -1,0 +1,318 @@
+---
+title: "Индивидуальное задание по проекту"
+author: "Группа 6 (19 команда по проекту), mikozlova"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+### Задание 
+
+Индивидуальное задание: 
+
+```{r, echo=F, message=FALSE}
+library(R3PO)
+R3PO::get_hw_ind_questions(login = "mikozlova")
+```
+
+### Предыдущий код
+
+Была взята часть кода из группового проекта, которая отвечает за преобразование данных для рекомендательной системы. Также будет использована часть с построением самой функции, но она уже будет в авторской части, так как необходимо провести дополнительную работу с данными, составляющими основу рекомендательной системы.
+
+```{r, echo=F, message=FALSE}
+#необходимые библиотеки
+library(tidyverse)
+library(tidytext) 
+library(tidyr) 
+library(stringr) 
+library(dplyr) 
+library(knitr)
+
+# предварительный код
+load("~/shared/minor2_2021/data/project/metadata_g_9.RData") # Загрузка метаданных с фильмами
+load("~/shared/minor2_2021/data/project/ratings_g_9.RData") # загрузка данных рейтингов
+
+#Загрузка датасета с imdbId и genres
+#Исходный датасет взят с сайта IMDB, содержал ~8млн. записей
+#Очищен с помощью inner_join с metadata
+load('~/imdbIdGenresDataset')
+
+#Присвоение фильму года выхода
+metadata = metadata %>% mutate(year = as.numeric(str_extract(title, '[0-9]{4}')))
+
+#Разбиение Фильмов по декадам
+metadata = metadata %>% mutate(decade = as.character(case_when(
+  (year >= 1990 & year < 2000) ~ 'nine',
+  (year >= 2000 & year < 2010) ~ 'zero',
+  (year >= 2010 & year < 2020) ~ 'ten',
+  TRUE ~ as.character(year)
+)))
+
+#Почистим imdbId у metadata от нулей в начале строки для корректного join'а
+metadata$imdbId = metadata$imdbId %>% str_replace_all('^0+', '')
+
+#объединение metadata с imdbIdGenresDataset
+metadata = metadata %>% left_join(imdbIdGenresDataset)
+
+#Приведем жанры, актеров и режиссеров к одному формату
+metadata$genres = metadata$genres %>% str_replace_all(",", " ")
+#Уберем дефис у жанров его содержащих - Sci-Fi и прочие
+metadata$genres = metadata$genres %>% str_replace_all('-', '')
+
+metadata$starring = metadata$starring %>% str_replace_all(" ","")
+metadata$starring = metadata$starring %>% str_replace_all(","," ")
+
+metadata$directedBy = metadata$directedBy %>% str_replace_all(" ","")
+metadata$directedBy = metadata$directedBy %>% str_replace_all(","," ")
+
+#Широкий формат по жанрам
+genresFilmTable = dplyr::select(metadata, item_id, genres)
+
+genresFilmTable = genresFilmTable %>% unnest_tokens(genre, genres, token = "words") %>%  mutate(genreMatch=1)
+
+genresFilmTable = genresFilmTable %>% pivot_wider(id_cols = item_id, names_from = genre, values_from = genreMatch, values_fill = 0)
+
+#Широкий формат по актерам
+actorFilmTable = dplyr::select(metadata, item_id, starring)
+
+actorFilmTable = actorFilmTable %>% unnest_tokens(actor, starring, token = "words") %>%  mutate(isActorPresented=1)
+
+actorFilmTable = actorFilmTable %>% pivot_wider(id_cols = item_id, names_from = actor, values_from = isActorPresented, values_fill = 0)
+
+#Широкий формат по режиссерам
+directorFilmTable = dplyr::select(metadata, item_id, directedBy)
+
+directorFilmTable = directorFilmTable %>% unnest_tokens(director, directedBy, token = "words") %>%  mutate(wasDirector=1)
+
+directorFilmTable = directorFilmTable %>% pivot_wider(id_cols = item_id, names_from = director, values_from = wasDirector, values_fill = 0)
+
+#Широкий формат по декадам
+decadeFilmTable = dplyr::select(metadata, item_id, decade)
+
+decadeFilmTable = decadeFilmTable %>% unnest_tokens(decade, decade, token = "words") %>%  mutate(wasDecade=1)
+
+decadeFilmTable = decadeFilmTable %>% pivot_wider(id_cols = item_id, names_from = decade, values_from = wasDecade, values_fill = 0)
+```
+
+
+### Решение
+
+В исходном датасете будет создана переменная, отвечающая за длину названия фильма. Далее эта переменная будет добавлена в датафрейм, который берется за основу для создания матрицы схожести фильмов. Рекомендательная система построена на основе функции, выполненной в групповом проекте. Результаты полученной рекомендательной системы будут оценены при помощи проверки на адекватность и сравнены со старым вариантом модели.
+
+```{r, echo=F}
+#Создание столбца с длинной названия 
+metadata = metadata %>% mutate(len=str_length(metadata$title))
+```
+
+```{r, echo=F, message=FALSE}
+#Функция, отдающая случайные 10 фильмов с высоким рейтингом > 4.0,
+#Используется для рекомендательных систем для выдачи фильмов пользователям, которые не оценили ни одного фильма
+
+set.seed(100)
+
+giveTopFilms = function(userId = NULL, numberOfFilms = 10)
+{ 
+  #Фильмы с рейтингом выше 4
+  topFilmsFromMetadata = metadata %>% filter (avgRating > 4.0)
+  
+  #Проверка на то, что userId передан и он есть в бд юзеров
+  isUserIdValid = !(is.null(userId)) && (as.character(userId) %in% survey_answers$user_id) 
+  
+  if(isUserIdValid){
+    usersFilms = topFilmsFromMetadata %>% 
+      (ratings %>% 
+      filter(user_id == userId))
+    
+    topFilmsFromMetadata = 
+      topFilmsFromMetadata %>% anti_join(usersFilms)
+    
+    topFilmsCount = as.numeric(count(topFilmsFromMetadata))
+    
+    if(topFilmsCount <= numberOfFilms){
+      topFilms = topFilmsFromMetadata %>% select(title, directedBy, genres, avgRating)
+      return (topFilms)
+    }
+    
+    randInt = sample(1:(topFilmsCount - numberOfFilms), 1)
+    topFilms = topFilmsFromMetadata[c(randInt:(randInt+9)),]
+    topFilms = topFilms %>% select(title, directedBy, genres, avgRating)
+    
+    return (topFilms)
+  } else {
+    topFilmsCount = as.numeric(count(topFilmsFromMetadata))
+    randInt = sample(1:(topFilmsCount - numberOfFilms), 1)
+    topFilms = topFilmsFromMetadata[c(randInt:(randInt+(numberOfFilms-1))),]
+    topFilms = topFilms %>% select(title, directedBy, genres, avgRating)
+
+    return (topFilms)
+  }
+}
+```
+
+
+```{r, echo=F, message=FALSE}
+#новая рекомендательная система
+
+#Создание датафрейма для матрицы схожести по декаде, длине названия, актерам и режисерам.
+cbRecommendDf = select(metadata, item_id, len)
+cbRecommendDf = cbRecommendDf %>% left_join(genresFilmTable)%>% left_join(actorFilmTable) %>% left_join(directorFilmTable) %>% left_join(decadeFilmTable)
+rownames = cbRecommendDf$item_id
+cbRecommendDf = cbRecommendDf %>% dplyr::select(-item_id)
+rownames(cbRecommendDf) = rownames
+
+#Матрица схожести с помощью косинусного расстояния
+sim = lsa::cosine(t(as.matrix(cbRecommendDf)))
+#Заменим диагональные элементы на 0
+diag(sim) = 0
+
+#Функция для Content-Based рекомендаций
+getFilms = function(userId, forTest = FALSE) {
+  
+  user = ratings %>% filter(userId == user_id & rating >= 4.0)
+  
+  if (nrow(user)==0) {
+    
+    recommend = giveTopFilms()
+  
+    } else {
+    
+    mostSimilar = head(sort(sim[,as.character(user$item_id)], decreasing = T))
+    a = which(sim[,as.character(user$item_id)] %in% mostSimilar, arr.ind = TRUE)
+    index = arrayInd(a, .dim = dim(sim[,as.character(user$item_id)]))
+    result = rownames(sim)[index[,1]]
+    recommend = filter(metadata, item_id %in% result) %>% dplyr::select(title, directedBy, genres, avgRating)
+    }
+  
+  if(isTRUE(forTest)){
+    return (recommend)
+  }
+  
+  return(knitr::kable(recommend))
+}
+```
+
+```{r, echo=F, message=FALSE}
+#старая рекомендательная система
+cbRecommendDf1 = select(metadata, item_id)
+cbRecommendDf1 = cbRecommendDf1 %>% left_join(genresFilmTable)%>% left_join(actorFilmTable) %>% left_join(directorFilmTable) %>% left_join(decadeFilmTable)
+rownames1 = cbRecommendDf1$item_id
+cbRecommendDf1 = cbRecommendDf1 %>% dplyr::select(-item_id)
+rownames(cbRecommendDf1) = rownames1
+
+#Матрица схожести с помощью косинусного расстояния
+sim1 = lsa::cosine(t(as.matrix(cbRecommendDf1)))
+#Заменим диагональные элементы на 0
+diag(sim1) = 0
+
+#Функция для Content-Based рекомендаций
+getFilms1 = function(userId, forTest = FALSE) {
+  
+  user = ratings %>% filter(userId == user_id & rating >= 4.0)
+  
+  if (nrow(user)==0) {
+    
+    recommend = giveTopFilms()
+  
+    } else {
+    
+    mostSimilar = head(sort(sim1[,as.character(user$item_id)], decreasing = T))
+    a = which(sim1[,as.character(user$item_id)] %in% mostSimilar, arr.ind = TRUE)
+    index = arrayInd(a, .dim = dim(sim1[,as.character(user$item_id)]))
+    result = rownames(sim1)[index[,1]]
+    recommend1 = filter(metadata, item_id %in% result) %>% dplyr::select(title, directedBy, genres, avgRating)
+    }
+  
+  if(isTRUE(forTest)){
+    return (recommend1)
+  }
+  
+  return(knitr::kable(recommend1))
+}
+```
+
+
+### Пример
+
+Для рассмотрения примера работы обеих систем сделаем специальную функцию, которая создает нового пользователя с выбранными фильмами и возвращает таблицу с фильмами, которые ему понравились и которые ему выдала рекомендация. Для начала, рассмотрим пример работы новой рекомендательной системы (с новой переменной - длина названия):
+
+```{r}
+#вывод для новой версии
+getRecommendForNewUserContentBased = function(itemIds) {
+  userId = max(ratings$user_id) + 1
+  set.seed(111)
+  numberOfMovies = length(itemIds)
+  userRatings = c()
+  while (numberOfMovies != 0) {
+    userRatings <- append(userRatings, runif(1, 4.0, 5.0))
+    numberOfMovies = numberOfMovies - 1
+  }
+
+  ratings <<- ratings %>% add_row(user_id = userId, item_id = itemIds, rating = userRatings)
+
+  filmsForUser = getFilms(userId,forTest = TRUE)
+  
+  #Проверка по параметрам directedBy, starring, decade, len + title для ясности
+  usersRatedFilms = metadata %>% filter (item_id %in% itemIds) %>% select(item_id, title,directedBy, starring,decade,genres,len)
+  usersRatedFilms = usersRatedFilms %>% mutate(flag = 'user')
+  
+  
+  if (nrow(usersRatedFilms) == 0) {
+    return (knitr::kable(filmsForUser))
+  }
+  
+  filmsForUser = metadata %>% filter(title %in% filmsForUser$title) %>% select(item_id, title,directedBy, starring,decade,genres,len)
+  filmsForUser = filmsForUser %>% mutate(flag = 'recommend')
+  
+  compareUserAndRecomendedFilms = rbind(usersRatedFilms,filmsForUser)
+  return(knitr::kable(compareUserAndRecomendedFilms))
+}
+
+itemIds = c(88405, 67087, 6155)
+getRecommendForNewUserContentBased(itemIds)
+```
+
+Далее рассмотрим работу старой системе на примере того же пользователя:
+```{r}
+#вывод для старой версии
+getRecommendForNewUserContentBased1 = function(itemIds) {
+  userId = max(ratings$user_id) + 1
+  set.seed(111)
+  numberOfMovies = length(itemIds)
+  userRatings = c()
+  while (numberOfMovies != 0) {
+    userRatings <- append(userRatings, runif(1, 4.0, 5.0))
+    numberOfMovies = numberOfMovies - 1
+  }
+
+  ratings <<- ratings %>% add_row(user_id = userId, item_id = itemIds, rating = userRatings)
+
+  filmsForUser = getFilms1(userId,forTest = TRUE)
+  
+  #Проверка по параметрам directedBy, starring, decade + title для ясности
+  usersRatedFilms = metadata %>% filter (item_id %in% itemIds) %>% select(item_id, title,directedBy, starring,decade,genres)
+  usersRatedFilms = usersRatedFilms %>% mutate(flag = 'user')
+  
+
+  if (nrow(usersRatedFilms) == 0) {
+    return (knitr::kable(filmsForUser))
+  }
+  
+  filmsForUser = metadata %>% filter(title %in% filmsForUser$title) %>% select(item_id, title,directedBy, starring,decade,genres)
+  filmsForUser = filmsForUser %>% mutate(flag = 'recommend')
+  
+  compareUserAndRecomendedFilms = rbind(usersRatedFilms,filmsForUser)
+  return(knitr::kable(compareUserAndRecomendedFilms))
+}
+
+itemIds = c(88405, 67087, 6155)
+getRecommendForNewUserContentBased1(itemIds)
+```
+
+
+Нашему пользорвателю нравятся фильмы, снятые в жанрах комедия и романтика в нулевых - десятых годах. 
+Старая рекомендательная система (нижний пример) работает достаточно хорошо, она выдает фильмы, в жанрах которых присутствуют комедия и романтика, также соблюдается условие и по декаде выхода фильмов. В рекомендации есть несколько фильмов с совпадениями по режиссерам и актерам, которые были в фильмах, которые понравились пользователю. 
+Новая система (первая таблица) выдает фильмы девяностых и десятых годов. В жанрах предложенных фильмов содержится один из любимых жанров пользователя, но нет фильмов, где бы они были вместе. По режиссерам совпадений с понравившимися пользователю фильмами нет, по актерам - есть, но их меньше, чем в старой модели. В целом, новая система работает неплохо, но хуже, чем старая.
+
+### Выводы
+
+В результате работы было создана новая  content-based система, которая помимо декады, актерского состава, жанра и режисеров включает в себя длину названия фильмов. При проверке на адекватность старой и новой ситсем выяснилось, что рекомендательная система с новой переменной работает хуже, чем старая модель.

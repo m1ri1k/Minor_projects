@@ -1,0 +1,229 @@
+---
+title: 'Проект SQL: анализ оттока клиентов банка'
+author: "Козлова Мария, mikozlova"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+## Задача
+
+Задача этого проекта заключается в анализе оттока клиентов банка, необходимо понять, почему клиенты банка не заключают новые договоры. Заказчику важно понимать возможный отток клиентов в будущем, чтобы грамотно планировать свои финансы, а также знать какие действия необходимы для уменьшения оттока, ведь это поможет сохранить или даже увеличить прибыль банка.
+
+## Анализ
+
+### Данные и логика анализа
+
+Для начала подключимся к базе. База содержит 3 таблицы: "country", "profile" и "portfolio".
+
+```{r message = FALSE, warning=FALSE, echo = F,include=FALSE}
+library(DBI)
+con <- dbConnect(RMariaDB::MariaDB(), 
+                 user='student2022minor', 
+                 password='DataMinorHSE!2020', 
+                 dbname='bank', 
+                 host='hsepiterdata-1.cqq6v5igyw1z.us-east-2.rds.amazonaws.com',
+                 port = 3315)
+dbListTables(con)
+```
+
+Для определения группы клиентов, с которой мы будем работать, проведем кластеризацю, то есть разделим клиентов на сегменты. Для проведения этой процедуры из базы данных "вытащим" необходимые нам переменные, которые содержатся в таблицах "profile" и "portfolio" (в этом проекте нас интересуют именно экономические данные о клиентах и некоторые данные о демографии клиентов), и затем преобразуем типы переменных. Кластеризация будет осуществляться методом k-means, в этом методе необходимо заранее указать количество кластеров, которое должно получиться, поэтому определим оптимальное количество кластеров при помощи "метода локтя", в нашем случае оптимальное кол-во кластеров будет равно 4.
+
+```{r, message = FALSE, warning=FALSE, echo = F,include=FALSE}
+data = dbGetQuery(con, "SELECT CreditScore, Tenure, Balance, NumOfProducts, 
+                          HasCrCard, IsActiveMember, Exited, EstimatedSalary, Age, Gender
+                         FROM profile JOIN portfolio
+                         ON profile.customerID = portfolio.customerID")
+library(dplyr)
+data = data %>% 
+  mutate(Exited = case_when(Exited == 0 ~ "Stayed", TRUE ~ "Exited")) %>% 
+  mutate(HasCrCard = case_when(HasCrCard == 0 ~ "No", TRUE ~ "Yes")) %>% 
+  mutate(IsActiveMember = case_when(IsActiveMember == 0 ~ "No", TRUE ~ "Yes"))
+data = data %>% mutate_if(is.character, as.factor)
+dataNum = fastDummies::dummy_cols(data, remove_first_dummy = TRUE)
+dataNum = dataNum %>% select(-Gender, -Exited, -HasCrCard, - IsActiveMember)
+```
+
+```{r, message = FALSE, warning=FALSE, echo = F}
+wss <- sapply(1:15, 
+              function(k){kmeans(dataNum, k, nstart=50,iter.max = 15 )$tot.withinss})
+plot(1:15, wss,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Количество кластеров",
+     ylab="Общая сумма квадратов внутри кластеров")
+```
+
+```{r message = FALSE, warning=FALSE, echo = F}
+set.seed(100)
+km = kmeans(scale(dataNum), centers = 4)
+dataNum$cluster = km$cluster
+
+library(DT)
+datatable(dataNum %>% group_by(cluster) %>% summarise_all(mean))
+```
+
+В группе под номером 1 все клиенты ушли из банка, эта группа имеет следующие отличительные признаки: в большинстве случаев это женщины, кредитный скоринг которых в среднем выше, чем в других группах, а также эти клиенты в среднем сотрудничают с банком меньше времени нежели остальные.
+Мы можем проверить в действительности ли женщины в большей степени имеют тенденцию к уходу из банка. 
+
+```{r, message = FALSE, warning=FALSE, echo = F}
+sex = dbGetQuery(con, "SELECT Gender, COUNT(*) AS number_all
+                         FROM portfolio INNER JOIN profile
+                         ON portfolio.CustomerId = profile.CustomerId
+                         GROUP BY Gender")
+
+sex_exited = dbGetQuery(con, "SELECT Gender, COUNT(*) AS number
+                         FROM portfolio INNER JOIN profile
+                         ON portfolio.CustomerId = profile.CustomerId
+                         WHERE Exited = 1
+                         GROUP BY Gender")
+
+sex_exited = sex_exited %>% inner_join(sex) %>% mutate(share = number/number_all)
+library(ggplot2)
+ggplot(sex_exited, aes(x=as.factor(Gender), y=share)) +
+  geom_bar(stat="identity",
+           fill = c('pink', 'lightblue')) +
+           labs(x='Пол', y = 'Доля') +
+           ggtitle('Доля количества уходов по половому признаку')
+```
+
+Женщины действительно чаще уходят из банка. Отфильтруем датасет, чтобы получить данные по выявленной подгруппе, эта подгруппа будет иметь следующие признаки: пол - женщины, кредитный скоринг в среднем выше, продолжительность работы с банком в среднем ниже
+
+Найдем медианы кредитного скоринга и переменной, которая показывает как долго клиент сотрудничает с банком, затем отфильтруем по ним и по половому признаку данные. 
+
+```{r message = FALSE, warning=FALSE, echo = F,include=FALSE}
+tenure_med = median(data$Tenure)
+credit_med = median(data$CreditScore)
+bank = dbGetQuery(con, "SELECT CreditScore, Tenure, Balance, NumOfProducts, 
+                          HasCrCard, IsActiveMember, Exited, EstimatedSalary, Age, Gender
+                          FROM profile INNER JOIN portfolio 
+                          ON profile.CustomerId = portfolio.CustomerId
+                          GROUP BY profile.CustomerId
+                          HAVING Gender = 'Female' AND Tenure < 5 AND CreditScore > 652")
+```
+
+Данные отфильтрованы, теперь мы можем закрыть соединение с базой.
+
+```{r}
+dbDisconnect(con)
+```
+
+### Модель
+
+Теперь перейдем к построению модели предсказания оттока. Для начала удалим переменную Gender, ведь представлен только один пол. Также переведем в фактор переменную Exited. Необходимо разделить данные на тестовую и обучающую выборки. 
+
+```{r message = FALSE, warning=FALSE, echo = F,include=FALSE}
+bank = bank %>% select(-Gender)
+bank$Exited = as.factor(bank$Exited)
+library(tidymodels)
+set.seed(2)
+split = initial_split(bank, prop = 0.80)
+bank_test = testing(split)
+bank_train = training(split)
+```
+
+Построим модель логистической регрессии, оценим ее качество и посмотрим на наиболее важные параметры.
+
+```{r message = FALSE, warning=FALSE, echo = F}
+set.seed(1)
+log =  logistic_reg() %>% fit(Exited~., data = bank_train)
+
+pred_log = predict(log, bank_test)
+
+datatable(bank_test %>% 
+  mutate(pred = pred_log$.pred_class) %>% 
+  conf_mat(estimate = pred, truth = Exited) %>% 
+  summary())
+```
+Модель имеет accuracy равное на тестовой 0.76, однако мы видим sensitivity равное 0.98 specificity = 0.15, что говорит о доминирующем количестве одного класса переменной Exited, чтобы сравнять соотношение переменных, проведем апсемплинг.
+
+```{r message = FALSE, warning=FALSE, echo = F}
+bank_up <- recipe(~., data = bank_train) %>%
+  themis::step_upsample(Exited) %>% 
+  prep(training = bank_train, retain = TRUE) %>% 
+  bake(new_data = NULL)
+
+set.seed(1)
+log_up =  logistic_reg() %>% fit(Exited~., data = bank_up)
+
+pred_log_up = predict(log_up, bank_test)
+
+datatable(bank_test %>% 
+  mutate(pred = pred_log_up$.pred_class) %>% 
+  conf_mat(estimate = pred, truth = Exited) %>% 
+  summary())
+```
+Мы немного понизили качество модели (accuracy = 0.67), однако значения sensitivity и specificity стали лучше. Теперь посмотрим на важность переменных в модели.
+
+```{r message = FALSE, warning=FALSE, echo = F}
+library(vip)
+vip(log_up)
+```
+
+Самый важный показатель - возраст, затем активность пользователя, баланс клиента, заработная плата, кредитный скоринг, длительность сотрудничества, количество продуктов и наличие кредитной карты.
+
+Также построим дерево решений, посмотрим на наиболее важные параметры в этой модели, сравним качество двух моделей и выберем наилучшую. 
+
+```{r, message = FALSE, warning=FALSE, echo = F}
+library(rpart)
+
+tree <- decision_tree(mode = "classification")
+tree <- tree %>% 
+  fit(Exited ~., data = bank_up)
+pred_tree = predict(tree, bank_test)
+
+datatable(bank_test %>% 
+  mutate(pred = pred_tree$.pred_class) %>% 
+  conf_mat(estimate = pred, truth = Exited) %>% 
+  summary())
+```
+
+```{r, message = FALSE, warning=FALSE, echo = F}
+library(rpart.plot)
+rpart.plot(tree$fit) 
+```
+
+```{r message = FALSE, warning=FALSE, echo = F}
+vip(tree)
+```
+
+Здесь мы получили большую точность (0.74). Здесь важными переменными являются (по убыванию важности): возраст, количество продуктов, активность, баланс, заработная плата, кредитный скоринг и продолжительность сотрудничества. Получилось чуть меньше важных переменных, чем в логистической регрессии, также можно увидеть, что первое разбиение в дереве решений приходится на возраст, что является не совсем корректным разбиением, ведь мы не можем напрямую влиять на возраст наших клиентов, поэтому в этой работе будем использовать модель логистической регрессии.
+
+
+### Симуляция
+
+Наиболее влияющая на отток переменная (за исключением возраста) - активность клиента, поэтому попробуем повлиять на нее. Посмотрим на распределение переменной Exited в зависимости от активности.
+
+```{r message = FALSE, warning=FALSE, echo = F}
+ggplot(bank) + geom_bar(aes(x = IsActiveMember, fill = Exited), position = "fill") +
+           labs(x='Активность пользователя', y = 'Доля ухода') +
+           ggtitle('Доля количества уходов в зависимости от активности')
+```
+
+Действительно, активные пользователи чаще остаются в банке нежели неактивные. Активность пользователя в банке можно увеличить путем создания некой мини-игры, за участие в которой пользователям будут даваться бонусы (скидки от партнеров, кешбэк, бесплатный пробный доступ к некоторым услугам банка и тп.). Предположим, что в 20% случаев нам удалось сделать пользователей активными, посмотрим на изменения в оттоке.
+
+```{r message = FALSE, warning=FALSE, echo = F}
+test = bank_test
+test$IsActiveMember[test$IsActiveMember == 0] = 
+  sample(c(0, 1), 
+         size = length(test$IsActiveMember[test$IsActiveMember == 0]),
+         replace = T, prob = c(0.8, 0.2))
+
+predTest = predict(log_up, test)$.pred_class
+ggplot(data.frame(predTest)) + geom_bar(aes(x = predTest), alpha = 0.5, fill = "red") +
+  geom_bar(data = bank_test, aes(x = Exited), alpha = 0.5)
+```
+
+На графике серый цвет показывает ситуацию до симуляции, красным - после. Как можно заметить, после симуляции отток клиентов увеличился, поэтому наше предположение оказалось неверным.
+
+
+### Дэшборд
+
+В дэшборд будут выноситься следующие элементы:интерактивный график, иллюстрирующий различия пользователей подгруппы в зависимости от их активности по наиболее важным в модели параметрам, а также интерактивный график, показывающий различие в оттоке между мужчинами и женщинами
+
+Дэшборд поможет наглядно выявить группу, которая склонная к оттоку. Он скорее представлен для маркетологов и аналитиков, ведь этот дэшборд поможет определить приоритеты стратегии по уменьшению оттока.
+
+
+## Общие выводы
+
+В начале работы была проведена кластеризация для определения подгруппы клиентов, которую необходимо исследовать. Была выбрана группа клиентов, которая чаще всего уходит из банка, так как именно эти клиенты больше всего интересуют заказчика. Выделенная подгруппа обладает следующими признаками: пол - женщины, кредитный скоринг в среднем выше, продолжительность работы с банком в среднем ниже.
+Далее были построены две модели: логистическая регрессия и дерево решений, для анализа была выбрана логистическая регрессия, так как она имела большее количество важных переменных. Один из самых важных параметров модели - активность пользователи, на основе нашей модели была проведена симуляция, которая заключалась в повышении активности пользователей для уменьшения оттока, но наше предположение не подтвердилось, отток увеличился. В будущем я бы вдобавок рассмотрела модели, которые не основываются на возрасте клиентов, ведь мы не можем прямо влиять на данный признак, возможно в таком мы бы увидели иные закономерности. 

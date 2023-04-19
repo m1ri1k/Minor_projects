@@ -1,0 +1,98 @@
+---
+title: "Отток клиентов банка"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+---
+ 
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(ggplot2)
+library(DBI)
+library(RSQLite)
+library(dplyr)
+library(crosstalk)
+library(plotly)
+
+
+con <- dbConnect(RMariaDB::MariaDB(), 
+                 user='student2022minor', 
+                 password='DataMinorHSE!2020', 
+                 dbname='bank', 
+                 host='hsepiterdata-1.cqq6v5igyw1z.us-east-2.rds.amazonaws.com',
+                 port = 3315)
+
+bank = dbGetQuery(con, "SELECT CreditScore, Tenure, Balance, NumOfProducts, 
+                          HasCrCard, IsActiveMember, Exited, EstimatedSalary, Age, Gender
+                          FROM profile INNER JOIN portfolio 
+                          ON profile.CustomerId = portfolio.CustomerId
+                          GROUP BY profile.CustomerId
+                          HAVING Gender = 'Female' AND Tenure < 5 AND CreditScore > 652")
+
+sex = dbGetQuery(con, "SELECT Gender, COUNT(*) AS number_all
+                         FROM portfolio INNER JOIN profile
+                         ON portfolio.CustomerId = profile.CustomerId
+                         GROUP BY Gender")
+
+sex_exited = dbGetQuery(con, "SELECT Gender, COUNT(*) AS number
+                         FROM portfolio INNER JOIN profile
+                         ON portfolio.CustomerId = profile.CustomerId
+                         WHERE Exited = 1
+                         GROUP BY Gender")
+
+sex_exited = sex_exited %>% inner_join(sex) %>% mutate(share = number/number_all)
+
+sex_stayed = dbGetQuery(con, "SELECT Gender, COUNT(*) AS number
+                         FROM portfolio INNER JOIN profile
+                         ON portfolio.CustomerId = profile.CustomerId
+                         WHERE Exited = 0
+                         GROUP BY Gender")
+
+sex_stayed = sex_stayed %>% inner_join(sex) %>% mutate(share = number/number_all)
+dbDisconnect(con)
+
+bank = bank %>% 
+  mutate(Exited = case_when(Exited == 0 ~ "Остался", TRUE ~ "Ушел"))  %>% 
+  mutate(IsActiveMember = case_when(IsActiveMember == 0 ~ "Неактивный", TRUE ~ "Активный"))
+```
+
+
+ 
+Column {data-width=600}
+-----------------------------------------------------------------------
+
+### Различия клиентов в зависимости от их активности по наиболее важным параметрам оттока
+
+```{r}
+sharedData <- SharedData$new(bank)
+bscols(widths = c(3,NA),
+  list(
+         filter_checkbox("Уход", "Уход клиента", sharedData, ~Exited),
+         filter_slider("Возраст", "Возраст", sharedData, ~Age),
+         filter_slider("Баланс", "Баланс", sharedData, ~Balance)
+       ),
+  plot_ly(sharedData, 
+        x = ~Age, y = ~Balance, color = ~as.factor(IsActiveMember), 
+        type = "scatter") %>% 
+  layout(title = " ",
+         xaxis = list(title = "Возраст"),
+         yaxis = list(title = "Баланс"))
+)
+```
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+### Различие в оттоке между мужчинами и женщинами
+
+```{r}
+gender = c("Мужчины", "Женщины")
+Exited = c(sex_exited$number[2], sex_exited$number[1])
+Stayed = c(sex_stayed$number[2], sex_stayed$number[1])
+data_sex <- data.frame(gender, Exited, Stayed)
+
+
+p = plot_ly(data_sex, x = ~gender, y = ~Exited, type = 'bar', name = 'Остались') %>%
+add_trace(y = ~Stayed, name = 'Ушли')
+
+layout(p,yaxis = list(title = 'Количество'), xaxis = list(title = 'Пол'), barmode = 'stack')
+```
